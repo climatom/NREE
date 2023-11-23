@@ -88,7 +88,7 @@ vanos_old=pk.load( open( lookup_dir+"vanos_old.p", "rb" ) )
 c = cdsapi.Client()
 # Init the counter
 counter=0
-for y in range(1993,2023):
+for y in range(2021,2023):
     for m in range(1,13):
         c.retrieve(
             'reanalysis-era5-single-levels',

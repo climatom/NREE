@@ -14,9 +14,11 @@ from numba import prange
 import cartopy.crs as ccrs
 import matplotlib.colors as colors
 from scipy.stats import rankdata
+from scipy.stats import binned_statistic
 import matplotlib.ticker as tkr
 from scipy.spatial import ConvexHull
 from scipy.optimize import minimize
+import xesmf as xe
 
 # Fast, explicit function to determine indices in lookup array
 #@nb.jit("float64[:](float64[:],float64[:],float64[:,:],float64[:,:],float64[:,:])")
@@ -84,9 +86,39 @@ def CRIT_RH_HI(ta,hi):
                           options={'tol':1e-6})    
     return out
 
+
+@nb.jit(nopython=True,fastmath=True)
+def TaTd2HI(ta,td,hiref,taref,tdref):
+    nr,nc=ta.shape
+    out=np.zeros((nr,nc))*np.nan
+    t_st=np.min(taref)
+    td_st=np.min(tdref)
+    res_t=taref[0,1]-taref[0,0]
+    res_td=tdref[1,0]-tdref[0,0]
+
+    for row in nb.prange(nr):
+        for col in nb.prange(nc):
+            i=int(np.floor((ta[row,col]-t_st)/res_t)) # Col
+            j=int(np.floor((td[row,col]-td_st)/res_td)) # Row
+                
+            # Might be that some cold obs fall off the lower end of the 
+            # lookup table. Protect against that here. 
+            if i < 0: i=0
+            if j < 0: j=0
+                
+            # Note that ref's columns are ta; rows are td
+            out[row,col]=hiref[j,i]
+                
+    return out  
+
 # Set parameters 
-yst=1993
-ystp=1995
+yst=1940
+ystp=2022
+yrs=np.arange(yst,ystp+1)
+p1=1950
+p2=2000
+window=20
+lookup_dir="/Users/k2147389/Desktop/Papers/homeostasis/output/"
 d="../ERA5/"
 plot_d="../Plots/"
 template=pk.load(open(d+"himax_2000.p",'rb'))
@@ -98,7 +130,14 @@ hi_lower=37.2 # Set anything < to NaN for plotting
 hi_thresh=71.5+273.15
 tw_thresh=35.0+273.15
 test_plot=False
+tfile="../hadcrut5.csv"
+res_rh=0.005
+res_ta=0.05
 
+# ../ta_lookup_ta%.3f_rh%.3f.p"%(res_ta,res_rh)
+hiref=pk.load( open( lookup_dir+"HI_lookup_ta%.3f_rh%.3f.p"%(res_ta,res_rh), "rb" ) )
+taref=pk.load( open( lookup_dir+"ta_lookup_ta%.3f_rh%.3f.p"%(res_ta,res_rh), "rb" ) )
+tdref=pk.load( open( lookup_dir+"td_lookup_ta%.3f_rh%.3f.p"%(res_ta,res_rh), "rb" ) )
 
 
 # Ref download -- to track lat/lon
@@ -111,11 +150,40 @@ lon2,lat2=np.meshgrid(reflon,reflat)
 landsea=xa.open_dataset(d+'landsea.nc')
 land=np.squeeze(landsea.lsm.data)
 
+# Global mean T 
+globt=pd.read_csv(tfile,index_col=0)
+# Re-normalise
+globt_pi=np.mean(globt.iloc[:30,:])
+globt=globt["t"].loc[np.logical_and(globt.index>=yst,globt.index<=ystp)]-globt_pi
+
+# Load population
+# ssp3, 2020
+pop20=xa.open_dataset('../ssp3_2020.nc')
+pop20_out = xa.Dataset(
+    {
+        "latitude": (["latitude"], refclim.latitude.data[:], {"units": "degrees_north"}),
+        "longitude": (["longitude"], refclim.longitude.data[:], {"units": "degrees_east"}),
+    }
+)
+regridder20=xe.Regridder(pop20, pop20_out, "bilinear")
+pop20=regridder20(pop20)
+# ssp3, 2050
+pop50=xa.open_dataset('../ssp3_2050.nc')
+pop50_out=xa.Dataset(
+    {
+        "lat": (["lat"], refclim.latitude.data[:], {"units": "degrees_north"}),
+        "lon": (["lon"], refclim.longitude.data[:], {"units": "degrees_east"}),
+    }
+)  
+regridder50=xe.Regridder(pop50, pop20_out, "bilinear")    
+pop50=regridder20(pop50)
+
 # Import city data
 city=pd.read_csv("../city_ref.csv")
 
 # Preallocate 
 vs=["ta","tw","hi"]
+vs_x=["rh","ta","p"]
 arc={}
 hi_ta=np.zeros((nt,nr,nc))
 hi_rh=np.zeros((nt,nr,nc))
@@ -125,60 +193,194 @@ vanos={}
 
 
 # Read in
+maxs=np.zeros((ystp-yst+1,len(vs)))
+rhs=np.zeros((ystp-yst+1,1))
+vcount=0
 for v in vs:
     arc[v]=np.zeros((nt,nr,nc))
+    for vx in vs_x: 
+        if v == "ta" and vx =="ta": continue
+        arc[v+"_"+vx]=np.zeros((nt,nr,nc))
+    
+    ycount=0
+    
     for y in range(yst,ystp+1):    
         arc[v][y-yst,:,:]=pk.load(open(d+"%s_max_%.0f.p"%(v,y),'rb'))
         if v != "tw": 
             off=-273.15
         else: off = 0
         arc[v][y-yst,:,:]+=off
+        
+        # Compute the max
         fldmax=np.nanmax(arc[v][y-yst,:,:])
         print("Max %s in year: %.0f = %.2fC"%(v,y,fldmax))
-        if v=="hi":
-            hi_ta[y-yst,:,:]=pk.load(open(d+"%s_tamax_%.0f.p"%(v,y),'rb'))-273.15
-            hi_rh[y-yst,:,:]=pk.load(open(d+"%s_rhmax_%.0f.p"%(v,y),'rb'))*100.
+        maxs[ycount,vcount]=fldmax
+        
+        # Load the extras
+        for vx in vs_x: 
+            if v == "ta" and vx =="ta": continue
+            arc[v+"_"+vx][y-yst,:,:]=\
+            pk.load(open(d+"%s_%smax_%.0f.p"%(v,vx,y),'rb'))
+            if vx == "ta": arc[v+"_"+vx][y-yst,:,:]+=off
+        
         if test_plot:
             levs=np.linspace(np.nanpercentile(arc[v],1),np.nanmax(arc[v]),50)
             fig, ax = plt.subplots(1,1)
             ax.contourf(lon2, lat2, arc[v][y-yst,:,:],cmap="turbo",levels=levs)
             fig.savefig(plot_d+"%s_%.0f.png"%(v,y))
-    _=np.nanmax(arc[v],axis=0)
-    maxima[v]=_
-    maxima[v+"_norm"]=rankdata(_).reshape(_.shape)/_.size
-    
-hi_idx=np.nanargmax(arc["hi"],axis=0)
-hi_ta=np.squeeze(np.take_along_axis(hi_ta,hi_idx[None,:,:],axis=0)).flatten()
-hi_rh=np.squeeze(np.take_along_axis(hi_rh,hi_idx[None,:,:],axis=0)).flatten()
-    
-    
-    
-vanos_old={}
-vanos_young={}
-vanos_death_hours_old=np.zeros((nr,nc))
-vanos_death_hours_young=np.zeros((nr,nc))
-
-for i in range(3,6):
-    vanos_old[i]=np.zeros((nt,nr,nc))
-    vanos_young[i]=np.zeros((nt,nr,nc))
-    
-    for y in range(yst,ystp+1): 
-        vanos_old[i][y-yst,:,:]=pk.load(open(d+"vanos_old_%.0f_%.0f.p"%(i,y),'rb'))
-        vanos_young[i][y-yst,:,:]=pk.load(open(d+"vanos_young_%.0f_%.0f.p"%(i,y),'rb'))
         
-    vanos_death_hours_old+=np.sum(vanos_old[i],axis=0)/(ystp-yst+1)
-    vanos_death_hours_young+=np.sum(vanos_young[i],axis=0)/(ystp-yst+1)
-
-city["old_dead_hy"]= NN(city["lat"].values[:],city["lon"].values[:],\
-           lat2,lon2,vanos_death_hours_old)
-city["young_dead_hy"]= NN(city["lat"].values[:],city["lon"].values[:],\
-            lat2,lon2,vanos_death_hours_young)   
-city["death_risk_old"]=city["old_dead_hy"]*city["pop"]
-city["death_risk_young"]=city["young_dead_hy"]*city["pop"]
-city.sort_values(by="death_risk_old",ascending=False,inplace=True)
+   
+        ycount+=1
+        
     
-vanos_death_hours_old[vanos_death_hours_old==0]=np.nan
-vanos_death_hours_young[vanos_death_hours_young==0]=np.nan
+    vcount+=1
+    
+    
+# Write NetCDF files 
+for v in vs:
+    if v !="ta":
+        
+        data_x=xa.Dataset({
+            
+            v:(("year","lat","lon"),arc[v]),
+            
+            v+"_ta":(("year","lat","lon"),arc[v+"_ta"]),
+     
+            v+"_rh":(("year","lat","lon"),arc[v+"_rh"]),
+ 
+            v+"_p":(("year","lat","lon"),arc[v+"_p"]),
+       
+            },
+            coords={"year":yrs,"lat":reflat,"lon":reflon}
+            )
+    else:
+        
+        data_x=xa.Dataset({
+            
+            v:(("year","lat","lon"),arc[v]),
+     
+            v+"_rh":(("year","lat","lon"),arc[v+"_rh"]),
+ 
+            v+"_p":(("year","lat","lon"),arc[v+"_p"]),
+       
+            },
+            coords={"year":yrs,"lat":reflat,"lon":reflon}
+            )
+            
+
+### NOTE -- need to amend so that we no longer refer to hi_rh/ta... instead, 
+### we should use arc[hi_rh] etc.    
+assert 1==2
+# Here we apply a rolling mean (using convlution to the time dimension of the HI)
+# Note that we scale max T corresponding to max HI
+kernel = np.ones(window) / window 
+hi_ta_s=np.apply_along_axis(np.convolve, axis=0, arr=hi_ta, v=kernel, mode='valid')
+# Also smooth the global mean series
+globt_s=globt.rolling(window,center=True).mean().dropna()
+
+# Fit regressions between hi_ta_s and glob_t
+intercepts,slopes,rs=ut.fast_regress3d(globt_s.values[:],hi_ta_s,nr,nc)
+s,i=np.polyfit(globt_s,hi_ta_s[:,0,0],1)
+# Now take the max of the last smooth years 
+
+
+# Here process into two sub periods (early and late). Note that the late 'window'
+# contains the t we want to scale
+ys=np.arange(yst,ystp+1)
+idx_p1=np.logical_and(ys>=p1,ys<=p1+window)
+idx_p2=np.logical_and(ys>=p1,ys<=p2+window)
+hi_p1=arc["hi"][idx_p1,:,:]
+hi_p2=arc["hi"][idx_p2,:,:]
+
+# These cubes will be overwritten with time maxima
+hi_ta_p1=hi_ta[idx_p1,:,:]
+hi_ta_p2=hi_ta[idx_p2,:,:] # target for scaling
+hi_rh_p1=hi_rh[idx_p1,:,:]
+hi_rh_p2=hi_rh[idx_p2,:,:] # target for scaling
+
+# Get indices of max hi in each slice 
+hi_idx_p1=np.nanargmax(arc["hi"][idx_p1,:,:],axis=0)
+hi_idx_p2=np.nanargmax(arc["hi"][idx_p2,:,:],axis=0)
+
+# Redefine now as the max (now 2d)
+hi_ta_p1=np.squeeze(np.take_along_axis(hi_ta_p1,hi_idx_p1[None,:,:],axis=0))
+hi_rh_p1=np.squeeze(np.take_along_axis(hi_rh_p1,hi_idx_p1[None,:,:],axis=0))
+hi_ta_p2=np.squeeze(np.take_along_axis(hi_ta_p2,hi_idx_p2[None,:,:],axis=0)) # ta target for scaling
+hi_rh_p2=np.squeeze(np.take_along_axis(hi_rh_p2,hi_idx_p2[None,:,:],axis=0))# rh target for scaling
+
+# Scale the ta using regression
+# Also create the plots here. 
+scaled={}
+ta_pow=np.linspace(25,60,100)
+rh_35 =np.zeros(len(ta_pow)) 
+rh_lu=np.zeros(len(ta_pow))
+ws=[0,1.5,2,4,8]
+bins=[150,150,150,200,300]
+frac20=np.zeros(len(ws))*np.nan
+frac50=np.zeros(len(ws))*np.nan
+wcount=0
+for ii in range(len(ta_pow)): 
+    rh_35[ii]=CRIT_RH(ta_pow[ii],35.).x[0]
+    rh_lu[ii]=CRIT_RH_HI(ta_pow[ii]+273.15,71.5+273.15).x[0]*100.
+for w in ws:
+    fig,ax=plt.subplots(1,1)
+    scaled_t=(w-globt_s.values[-1])*slopes+hi_ta_p2 # New t
+    td=ut._rhDew2d(nr,nc,hi_rh_p2,hi_rh_p2)+273.15 # Old rh
+    scaled['%.0f'%w]=TaTd2HI(scaled_t+273.15,td,hiref,taref,tdref)-273.15 # new rh
+    # frac20[wcount]=np.nansum(pop20['ssp3_2020'].data[scaled['%.0f'%w]>=71.5])/np.nansum(pop20).ssp3_2020.data
+    # frac50[wcount]=np.nansum(pop50['ssp3_2050'].data[scaled['%.0f'%w]>=71.5])/np.nansum(pop50).ssp3_2050.data 
+    counts,xbins,ybins,image=ax.hist2d(scaled_t.flatten(),hi_rh_p2.flatten(),bins=bins[wcount],\
+                                          norm=colors.LogNorm(),cmap = "cividis")
+    ax.plot(ta_pow,rh_lu,color='red',linestyle="-",linewidth=4)
+    ax.set_xlabel("Air temperature [$^{\circ}$C]")
+    ax.set_ylabel("Relative humidity [%]")
+    ax.set_xlim(25,52)
+    ax.set_ylim(0,100)
+    ax.grid()
+    fig.set_size_inches(6,5)
+    fig.set_dpi(800)
+    fig.savefig(plot_d+"ERA5_SCATTER_%.0f_+%.1fC.png"%(p2,w))
+    
+    wcount+=1
+        
+assert 1==2    
+
+fig,ax=plt.subplots(1,1)
+ax.plot(ta_pow,rh_lu,color='red',linestyle="-",linewidth=4)
+ax.set_xlabel("Air temperature [$^{\circ}$C]")
+ax.set_ylabel("Relative humidity [%]")
+ax.grid()
+ax.set_xlim(25,52)
+ax.set_ylim(0,100)
+fig.set_size_inches(6,5)
+fig.set_dpi(800)
+fig.savefig(plot_d+"WIRED_DEMO.png")
+# vanos_old={}
+# vanos_young={}
+# vanos_death_hours_old=np.zeros((nr,nc))
+# vanos_death_hours_young=np.zeros((nr,nc))
+
+# for i in range(3,6):
+#     vanos_old[i]=np.zeros((nt,nr,nc))
+#     vanos_young[i]=np.zeros((nt,nr,nc))
+    
+#     for y in range(yst,ystp+1): 
+#         vanos_old[i][y-yst,:,:]=pk.load(open(d+"vanos_old_%.0f_%.0f.p"%(i,y),'rb'))
+#         vanos_young[i][y-yst,:,:]=pk.load(open(d+"vanos_young_%.0f_%.0f.p"%(i,y),'rb'))
+        
+#     vanos_death_hours_old+=np.sum(vanos_old[i],axis=0)/(ystp-yst+1)
+#     vanos_death_hours_young+=np.sum(vanos_young[i],axis=0)/(ystp-yst+1)
+
+# city["old_dead_hy"]= NN(city["lat"].values[:],city["lon"].values[:],\
+#            lat2,lon2,vanos_death_hours_old)
+# city["young_dead_hy"]= NN(city["lat"].values[:],city["lon"].values[:],\
+#             lat2,lon2,vanos_death_hours_young)   
+# city["death_risk_old"]=city["old_dead_hy"]*city["pop"]
+# city["death_risk_young"]=city["young_dead_hy"]*city["pop"]
+# city.sort_values(by="death_risk_old",ascending=False,inplace=True)
+    
+# vanos_death_hours_old[vanos_death_hours_old==0]=np.nan
+# vanos_death_hours_young[vanos_death_hours_young==0]=np.nan
 
 # Plot world map(s)
 ## First, abs quantitites
@@ -255,17 +457,41 @@ for ii in range(len(ta_pow)):
 rh_35 =np.zeros(len(ta_pow)) 
 for ii in range(len(ta_pow)):
    rh_35[ii]=CRIT_RH(ta_pow[ii],35.).x[0]
+   
+   
+# Scatter 
+fig,ax=plt.subplots(1,1,figsize=(5,4),dpi=500)
+# Get cloud's upper limit
+vals_p1,bins_p1,_ =binned_statistic(hi_ta_p1,hi_rh_p1,
+                             statistic=lambda y: np.nanpercentile(y,99.99),
+                             bins=25)
 
-fig,ax=plt.subplots(1,1)
-ax.scatter(hi_ta,hi_rh,s=0.001,c='k')
-ax.plot(vl["ta"],rh_vl)
-ax.plot(ta_pow,rh_pow)
-ax.plot(ta_pow,rh_lu)
-ax.plot(ta_pow,rh_35)
-ax.set_xlim(25,55)
-ax.set_ylim(0,100)
+vals_p2,bins_p2,_ =binned_statistic(hi_ta_p2,hi_rh_p2,
+                             statistic=lambda y: np.nanpercentile(y,99.99),
+                             bins=25)
+
+mids_p1=(bins_p1[1:]+bins_p1[0:-1])/2.
+mids_p2=(bins_p2[1:]+bins_p2[0:-1])/2.
+#counts,xbins,ybins,image = plt.hist2d(hi_ta_p1,hi_rh_p1,bins=100,\
+                                      #norm=colors.LogNorm(),cmap = "turbo")
+
+#ax.scatter(hi_ta,hi_rh,s=0.001,c='k')
+ax.plot(mids_p1,vals_p1,color='magenta')
+ax.plot(mids_p2,vals_p2,color='cyan')
+
+#ax.contour(counts.transpose(),extent=[xbins[0],xbins[-1],ybins[0],ybins[-1]],
+#           levels=50)
+#ax.plot(vl["ta"],rh_vl)
+# ax.plot(ta_pow,rh_pow,color='k',linestyle="--",linewidth=3)
+ax.plot(ta_pow,rh_lu,color='red',linestyle="-",linewidth=3)
+ax.plot(ta_pow,rh_35,color='blue',linestyle="-",linewidth=3)
+ax.plot()
 ax.grid()
-
+ax.set_xlabel("Ta [$^{\circ}$C]")
+ax.set_ylabel("RH [%]")
+ax.set_xlim(25,52)
+ax.set_ylim(0,100)
+fig.savefig(plot_d+"ERA5_SCATTER.png")
 
 # Now go back up and: (1) extract the T and RH during the max HI. Plot this
 # Also include a moving average: rh as f(T)

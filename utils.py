@@ -1044,3 +1044,30 @@ def DJ(T_k, p_t, p0ndplam):
     return foftk,fdT
 
 
+@nb.njit(fastmath=True)
+def fast_regress3d(x,y,nr,nc):
+    """y is 3 dimensional. Grid must be shaped len(x) | nr | nt. Regression
+    Performed for x against first dim of y"""
+    assert len(x) == y.shape[0],"Vectors not the same length!"
+    n=float(len(x))
+    b=np.zeros((nr,nc))*np.nan
+    a=np.zeros((nr,nc))*np.nan
+    corr=np.zeros((nr,nc))*np.nan
+    xmu=np.mean(x)
+    xprime=x-xmu
+    xprime_sq_sum=np.sum(xprime**2)
+    xstd=np.std(x)
+    ymu=np.sum(y,axis=0)/n
+    yprime=y-ymu
+    for r in prange(nr):
+        for c in prange(nc):
+            ymu=np.mean(y[:,r,c])
+            num=np.dot(xprime,yprime[:,r,c])
+            b[r,c]=num/xprime_sq_sum
+            a[r,c]=ymu-b[r,c]*xmu
+            corr[r,c]=num/(np.sqrt(xprime_sq_sum*np.sum(yprime[:,r,c]**2)))
+            
+    return a,b,corr
+
+
+
